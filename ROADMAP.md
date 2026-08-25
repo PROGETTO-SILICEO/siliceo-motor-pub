@@ -37,8 +37,17 @@ un test che la dimostri. F0–F2.5 e la configurazione dinamica sono completate 
 - **Verifica**: swap Qwen 0.5B ↔ SmolLM2 135M a server acceso; patch runtime applicata
   alla generazione successiva; parity logits invariata dopo ogni modifica
 
-## 🔜 F3 — Backend CUDA (kernels in Rust via cust-rs)
-- Gemm f16/bf16/int8, KV cache su device, offload a layer parziale → totale
+## 🚧 F3 — Backend CUDA (kernel scritti in Rust, compilati a PTX/cubin)
+- ✅ Astrazione `Device`: forward e generazione backend-agnostici (CPU oggi, CUDA/Vulkan domani)
+- ✅ Pipeline kernel sovrana operativa: Rust → rustc_codegen_nvvm → PTX → ptxas → cubin
+  **precompilato a build time** (niente JIT del driver all'avvio: avvio deterministico)
+- ✅ Kernel f32 con parity GPU/CPU misurata a 1–2 ulp: matmul, RMSNorm, RoPE NEOX,
+  softmax, SwiGLU (silu-mul), add residuo — matematica via crate `libm`,
+  rimappata automaticamente agli intrinsics libdevice dal codegen NVVM
+- 🔜 Pesi e KV cache residenti su device, kernel di attenzione fused GQA,
+  forward completo con parity token-identica vs CPU
+- 🔜 Quantizzazione on-device: fused dequant-matmul sui K-quants
+  (i pesi Q4_K_M restano compressi in VRAM — requisito, non ottimizzazione)
 - Filosofia: kernel posseduti, non wrapper. FFI cuBLASLt solo come fallback documentato
 - **Target**: 9B Q4_K_M ≥ 40 tok/s single-stream su RTX 3090
 
