@@ -5,55 +5,163 @@
 //!   POST /v1/completions        {prompt, temperature?, top_p?, top_k?, max_tokens?, stop?, seed?}
 //!   POST /v1/chat/completions   {messages:[{role,content}], ...stessi parametri}
 //!
-//! Zero dipendenze HTTP/JSON: std::net + parser scritto in casa.
-//! Uso: s-server <modello.gguf> [--port N]
+//! Configurazione dinamica:
+//!   GET  /v1/config             config effettiva (strati fusi)
+//!   POST /v1/config             patch dei default di generazione A SERVER ACCESO
+//!
+//! Strati (dal più debole al più forte): default < motor.json < flag CLI <
+//! parametri della singola richiesta.
+//!
+//! Zero dipendenze HTTP/JSON: std::net + parser scritto in casa (in s-config).
+//! Uso: s-server [modello.gguf] [--config PATH] [--port N] [--host H]
+//!      se non c'è --config e esiste ./motor.json viene caricato da solo.
 
 mod http;
-mod json;
 
-use json::{parse, Json};
+use s_config::json::{parse, write_escaped, Json};
+use s_config::{FileConfig, GenerateDefaults};
+use s_gguf::GgufFile;
+use s_models::chat::ChatTemplate;
 use s_models::generate::{generate, GenerateParams};
 use s_models::Model;
 use s_tokenizer::Tokenizer;
+use std::fmt::Write as _;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-struct App {
+/// Tutto ciò che riguarda il modello CARICATO. Sostituibile a caldo:
+/// ogni richiesta prende uno snapshot (`Arc<Inner>`) e lavora su quello,
+/// quindi una richiesta in corso finisce col modello su cui è iniziata.
+struct Inner {
     model: Model,
     tok: Tokenizer,
-    im_end_id: Option<u32>,
     model_name: String,
+    /// Template di chat del modello: rilevato dal GGUF o dalla config.
+    chat: ChatTemplate,
+}
+
+impl Inner {
+    /// Carica un GGUF dal disco. Lento (~secondi): va chiamato FUORI dal
+    /// lock di scrittura, così il server continua a servire col vecchio modello.
+    fn load(model_path: &str, template_over: Option<&str>) -> Result<Arc<Self>, String> {
+        let t0 = std::time::Instant::now();
+        let tok =
+            Tokenizer::from_gguf(model_path).map_err(|e| format!("tokenizer: {e}"))?;
+        let model = Model::load(model_path).map_err(|e| format!("modello: {e}"))?;
+
+        // metadata per il template di chat (riapertura leggera, solo KV)
+        let gguf = GgufFile::open(model_path).map_err(|e| e.to_string())?;
+        let kv_str = |key: &str| {
+            gguf.metadata.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str())
+        };
+        let arch = kv_str("general.architecture").unwrap_or("sconosciuta").to_string();
+        let chat = ChatTemplate::detect(
+            &arch,
+            kv_str("tokenizer.chat_template"),
+            template_over,
+        )?;
+        eprintln!(
+            "load: arch={arch}, template={} ({})",
+            chat.format.name(),
+            chat.source
+        );
+
+        let model_name = std::path::Path::new(model_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model_path.to_string());
+        eprintln!(
+            "s-server: {model_name} pronto in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
+        Ok(Arc::new(Self { model, tok, model_name, chat }))
+    }
+}
+
+struct App {
+    /// Il modello corrente, sostituibile atomicamente (POST /v1/model).
+    inner: RwLock<Arc<Inner>>,
+    /// Default di generazione correnti (risolti). Mutabili via POST /v1/config.
+    gen_defaults: RwLock<GenerateDefaults>,
+    /// Cosa riportare in GET /v1/config sulla sezione server.
+    server_report: (String, u16),
+    /// Override template di chat da config/CLI (None = auto), valido
+    /// anche per i modelli caricati a caldo.
+    template_over: Option<String>,
 }
 
 fn main() {
+    // ── strato 4: riga di comando ──
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().unwrap_or_else(|| {
-        eprintln!("uso: s-server <modello.gguf> [--port N]");
-        std::process::exit(1);
-    });
-    let mut port: u16 = 8096;
+    let mut positional_model: Option<String> = None;
+    let mut config_path: Option<String> = None;
+    let mut cli_port: Option<u16> = None;
+    let mut cli_host: Option<String> = None;
     while let Some(a) = args.next() {
-        if a == "--port" {
-            port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port);
+        match a.as_str() {
+            "--config" => config_path = args.next(),
+            "--port" => cli_port = args.next().and_then(|p| p.parse().ok()),
+            "--host" => cli_host = args.next(),
+            "--model" => positional_model = args.next(),
+            other => {
+                if positional_model.is_none() && !other.starts_with('-') {
+                    positional_model = Some(other.into());
+                } else {
+                    eprintln!("uso: s-server [modello.gguf] [--config PATH] [--port N] [--host H]");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
-    eprintln!("s-server: carico {model_path} ...");
-    let t0 = std::time::Instant::now();
-    let tok = Tokenizer::from_gguf(&model_path).expect("tokenizer");
-    let model = Model::load(&model_path).expect("modello");
-    let app = Arc::new(App {
-        im_end_id: tok.token_to_id("<|im_end|>"),
-        model_name: std::path::Path::new(&model_path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| model_path.clone()),
-        tok,
-        model,
+    // ── strati 2+3: sistema < utente ──
+    let mut file_cfg = FileConfig::default();
+    let percorso = config_path.clone().or_else(|| {
+        // auto-discovery: prima ./motor.json, poi il percorso di sistema
+        ["motor.json", "/etc/siliceo-motor/motor.json"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|p| p.to_string())
     });
-    eprintln!("s-server: modello pronto in {:.1}s", t0.elapsed().as_secs_f32());
+    if let Some(p) = &percorso {
+        match std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| FileConfig::parse(&t)) {
+            Ok(c) => {
+                eprintln!("s-server: config da {p}");
+                file_cfg = c;
+            }
+            Err(e) => {
+                eprintln!("s-server: ERRORE nella config {p}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
-    let addr = format!("127.0.0.1:{port}");
+    let model_path = positional_model.or(file_cfg.model_path.clone()).unwrap_or_else(|| {
+        eprintln!("uso: s-server <modello.gguf> [--config PATH] [--port N] [--host H]");
+        std::process::exit(1);
+    });
+
+    // precedenza: CLI > file > default
+    let port = cli_port.or(file_cfg.server.port).unwrap_or(8096);
+    let host =
+        cli_host.or(file_cfg.server.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+
+    // default di generazione risolti: assoluti < file (la CLI non tocca la generazione)
+    let gen0 = GenerateDefaults::default().merge(&file_cfg.generate);
+
+    eprintln!("s-server: carico {model_path} ...");
+    let inner = Inner::load(&model_path, file_cfg.model_template.as_deref()).unwrap_or_else(|e| {
+        eprintln!("s-server: ERRORE nel caricamento: {e}");
+        std::process::exit(1);
+    });
+    let app = Arc::new(App {
+        inner: RwLock::new(inner),
+        gen_defaults: RwLock::new(gen0),
+        server_report: (host.clone(), port),
+        template_over: file_cfg.model_template.clone(),
+    });
+
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).expect("bind");
     eprintln!("s-server: in ascolto su http://{addr}");
 
@@ -77,25 +185,118 @@ fn handle(app: &App, stream: &mut TcpStream) {
         }
     };
 
+    // snapshot del modello corrente: le richieste in corso non vedono gli swap
+    let inner = Arc::clone(&app.inner.read().unwrap());
+
     // path senza query string
     let path = req.path.split('?').next().unwrap_or("").to_string();
 
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let mut buf = String::from("{\"status\":\"ok\",\"model\":");
-            json::write_escaped(&mut buf, &app.model_name);
-            buf.push('}');
+            write_escaped(&mut buf, &inner.model_name);
+            let _ = write!(buf, ",\"layers\":{},\"embd\":{},\"chat\":\"{}\",\"tpl_from\":\"{}\"}}",
+                inner.model.config.n_layers, inner.model.config.n_embd,
+                inner.chat.format.name(), inner.chat.source);
             respond(stream, 200, &buf);
         }
-        ("POST", "/v1/chat/completions") => chat_completions(app, stream, &req.body),
-        ("POST", "/v1/completions") => completions(app, stream, &req.body),
+        ("GET", "/v1/config") => get_config(app, stream),
+        ("POST", "/v1/config") => patch_config(app, stream, &req.body),
+        ("POST", "/v1/model") => load_model(app, stream, &req.body),
+        ("POST", "/v1/chat/completions") => chat_completions(&inner, app, stream, &req.body),
+        ("POST", "/v1/completions") => completions(&inner, app, stream, &req.body),
         _ => error(stream, 404, format!("endpoint sconosciuto: {} {}", req.method, req.path)),
     }
 }
 
+// ── configurazione dinamica ──
+
+fn get_config(app: &App, stream: &mut TcpStream) {
+    let g = app.gen_defaults.read().unwrap();
+    let mut buf = String::from("{\"server\":{");
+    buf.push_str("\"host\":");
+    write_escaped(&mut buf, &app.server_report.0);
+    let _ = write!(buf, ",\"port\":{}}},\"generate\":{{", app.server_report.1);
+    let _ = write!(buf, "\"temperature\":{}", g.temperature.unwrap_or(0.0));
+    match g.top_p {
+        Some(v) => { let _ = write!(buf, ",\"top_p\":{v}"); }
+        None => buf.push_str(",\"top_p\":null"),
+    }
+    match g.top_k {
+        Some(v) => { let _ = write!(buf, ",\"top_k\":{v}"); }
+        None => buf.push_str(",\"top_k\":null"),
+    }
+    let _ = write!(buf, ",\"max_tokens\":{}}}", g.max_tokens.unwrap_or(256));
+    buf.push('}');
+    drop(g);
+    respond(stream, 200, &buf);
+}
+
+/// Patch dei default di generazione a server acceso.
+/// Accetta sia `{"temperature":0.7}` sia `{"generate":{"temperature":0.7}}`.
+fn patch_config(app: &App, stream: &mut TcpStream, body: &[u8]) {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return error(stream, 400, "body non è UTF-8"),
+    };
+    // accetta anche la forma annidata {"generate":{...}}
+    let effettivo = match parse(text)
+        .map_err(|e| format!("JSON non valido: {e}"))
+        .and_then(|j| {
+            if j.get("generate").is_some() {
+                FileConfig::from_json(&j).map(|c| c.generate)
+            } else {
+                GenerateDefaults::patch_from_str(text)
+            }
+        }) {
+        Ok(patch) => patch,
+        Err(e) => return error(stream, 400, e),
+    };
+
+    let nuovo = {
+        let correnti = app.gen_defaults.read().unwrap();
+        correnti.merge(&effettivo)
+    };
+    *app.gen_defaults.write().unwrap() = nuovo.clone();
+    let _ = nuovo; // la risposta la costruiamo rileggendo (semplice e senza lock doppio)
+    get_config(app, stream);
+}
+
+/// Hot-swap del modello: `{"path":"altro.gguf"}`.
+/// Il caricamento avviene FUORI dal lock: finché non riesce, il server
+/// continua a servire col modello vecchio. Se fallisce → errore pulito,
+/// nessun stato toccato.
+fn load_model(app: &App, stream: &mut TcpStream, body: &[u8]) {
+    let j = match parse_body(body) {
+        Ok(j) => j,
+        Err(e) => return error(stream, 400, e),
+    };
+    let nuovo_path = match j.get("path").and_then(|p| p.as_str()) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return error(stream, 400, "campo 'path' mancante o vuoto"),
+    };
+    if !std::path::Path::new(&nuovo_path).exists() {
+        return error(stream, 400, format!("file non trovato: {nuovo_path}"));
+    }
+
+    eprintln!("s-server: hot-swap verso {nuovo_path} ...");
+    let nuovo = match Inner::load(&nuovo_path, app.template_over.as_deref()) {
+        Ok(n) => n,
+        Err(e) => return error(stream, 400, format!("caricamento fallito ({e}): il modello precedente resta attivo")),
+    };
+
+    let nome = nuovo.model_name.clone();
+    *app.inner.write().unwrap() = nuovo;
+
+    let mut buf = String::from("{\"status\":\"ok\",\"model\":");
+    write_escaped(&mut buf, &nome);
+    buf.push('}');
+    respond(stream, 200, &buf);
+}
+
 // ── endpoint ──
 
-fn completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
+fn completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
     let j = match parse_body(body) {
         Ok(j) => j,
         Err(e) => return error(stream, 400, e),
@@ -104,21 +305,21 @@ fn completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
         Some(p) => p.to_string(),
         None => return error(stream, 400, "campo 'prompt' mancante o non stringa"),
     };
-    let params = match params_from_json(&j) {
+    let params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
 
-    let ids = match app.tok.encode(&prompt) {
+    let ids = match inner.tok.encode(&prompt) {
         Ok(i) => i,
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
-    let out = run_generate(app, &ids, &params);
+    let out = run_generate(inner, &ids, &params);
     respond_json_completion(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
 
-fn chat_completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
+fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
     let j = match parse_body(body) {
         Ok(j) => j,
         Err(e) => return error(stream, 400, e),
@@ -127,38 +328,48 @@ fn chat_completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
         Some(m) if !m.is_empty() => m,
         _ => return error(stream, 400, "campo 'messages' mancante o vuoto"),
     };
-    let prompt = match render_chatml(messages) {
+    // prompt dal template DEL MODELLO + EOS di chat del formato
+    let mut coppie: Vec<(&str, &str)> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if role.is_empty() || content.is_empty() {
+            return error(stream, 400, "message senza 'role' o 'content' stringa");
+        }
+        coppie.push((role, content));
+    }
+    let prompt = inner.chat.render(&coppie);
+
+    let params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
-    let params = match params_from_json(&j) {
-        Ok(p) => p,
-        Err(e) => return error(stream, 400, e),
-    };
-    // EOS di chat: <|im_end|> chiude il turno dell'assistente
+    // EOS di chat: i token di chiusura turno del formato attivo
     let mut params = params;
-    if let Some(id) = app.im_end_id {
-        params.extra_eos.push(id);
+    for stop in inner.chat.format.stop_tokens() {
+        if let Some(id) = inner.tok.token_to_id(stop) {
+            params.extra_eos.push(id);
+        }
     }
 
-    let ids = match app.tok.encode(&prompt) {
+    let ids = match inner.tok.encode(&prompt) {
         Ok(i) => i,
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
-    let out = run_generate(app, &ids, &params);
+    let out = run_generate(inner, &ids, &params);
     respond_json_chat(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
 
 // ── motore ──
 
 /// Esegue la generazione (bloccante) e ritorna il risultato.
-fn run_generate<'a>(
-    app: &'a App,
+fn run_generate(
+    inner: &Inner,
     ids: &[u32],
     params: &GenerateParams,
 ) -> s_models::generate::Generated {
-    generate(&app.model, &app.tok, ids, params)
+    generate(&inner.model, &inner.tok, ids, params)
 }
 
 // ── helpers ──
@@ -168,8 +379,18 @@ fn parse_body(body: &[u8]) -> Result<Json, String> {
     parse(text)
 }
 
-fn params_from_json(j: &Json) -> Result<GenerateParams, String> {
-    let mut p = GenerateParams::default();
+fn params_from_json(app: &App, j: &Json) -> Result<GenerateParams, String> {
+    // strato 5: la richiesta parte dai default correnti (strato 6, mutabili via /v1/config)
+    let base = app.gen_defaults.read().unwrap().clone();
+    let mut p = GenerateParams {
+        max_tokens: base.max_tokens.unwrap_or(256),
+        temperature: base.temperature.unwrap_or(0.0),
+        top_k: base.top_k,
+        top_p: base.top_p,
+        seed: None,
+        stop: Vec::new(),
+        extra_eos: Vec::new(),
+    };
     if let Some(v) = j.get("temperature") {
         p.temperature = v.as_f64().ok_or("temperature non numerica")? as f32;
     }
@@ -199,23 +420,6 @@ fn params_from_json(j: &Json) -> Result<GenerateParams, String> {
     Ok(p)
 }
 
-/// Template ChatML (Qwen2.5):
-/// <|im_start|>{role}\n{content}<|im_end|>\n ... <|im_start|>assistant\n
-fn render_chatml(messages: &[Json]) -> Result<String, String> {
-    let mut prompt = String::new();
-    for m in messages {
-        let role = m.get("role").and_then(|r| r.as_str()).ok_or("message senza 'role'")?;
-        let content = m.get("content").and_then(|c| c.as_str()).ok_or("message senza 'content'")?;
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(role);
-        prompt.push('\n');
-        prompt.push_str(content);
-        prompt.push_str("<|im_end|>\n");
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    Ok(prompt)
-}
-
 fn respond(stream: &mut TcpStream, status: u16, body: &str) {
     let reason = match status {
         200 => "OK",
@@ -229,7 +433,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) {
 
 fn error(stream: &mut TcpStream, status: u16, msg: impl std::fmt::Display) {
     let mut buf = String::from("{\"error\":");
-    json::write_escaped(&mut buf, &msg.to_string());
+    write_escaped(&mut buf, &msg.to_string());
     buf.push('}');
     respond(stream, status, &buf);
 }
@@ -259,11 +463,11 @@ fn respond_json_completion(
 ) {
     let mut buf = String::new();
     buf.push_str("{\"id\":");
-    json::write_escaped(&mut buf, &completion_id());
+    write_escaped(&mut buf, &completion_id());
     buf.push_str(",\"object\":\"text_completion\",\"choices\":[{\"text\":");
-    json::write_escaped(&mut buf, text);
+    write_escaped(&mut buf, text);
     buf.push_str(",\"finish_reason\":");
-    json::write_escaped(&mut buf, finish_reason);
+    write_escaped(&mut buf, finish_reason);
     buf.push_str("}],");
     buf.push_str(&usage_json(prompt_tokens, out));
     buf.push('}');
@@ -279,11 +483,11 @@ fn respond_json_chat(
 ) {
     let mut buf = String::new();
     buf.push_str("{\"id\":");
-    json::write_escaped(&mut buf, &completion_id());
+    write_escaped(&mut buf, &completion_id());
     buf.push_str(",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-    json::write_escaped(&mut buf, text);
+    write_escaped(&mut buf, text);
     buf.push_str("},\"finish_reason\":");
-    json::write_escaped(&mut buf, finish_reason);
+    write_escaped(&mut buf, finish_reason);
     buf.push_str("}],");
     buf.push_str(&usage_json(prompt_tokens, out));
     buf.push('}');

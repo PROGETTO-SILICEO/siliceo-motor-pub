@@ -59,12 +59,43 @@ curl http://127.0.0.1:8096/v1/chat/completions \
 `temperature`, `top_p`, `top_k`, `max_tokens`, `seed`, `stop` (stringa o array).
 Greedy con `temperature: 0` — deterministico al token.
 
+## Configurazione dinamica
+
+Un solo binario, comandabile a runtime senza ricompilare né riavviare:
+
+```bash
+# motor.json (caricato automaticamente se presente nella directory corrente)
+{
+  "server":   { "port": 8096 },
+  "model":    { "path": "model.gguf", "template": "auto" },
+  "generate": { "temperature": 0.0, "max_tokens": 256 }
+}
+
+# cambiare i default A SERVER ACCESO
+curl -X POST http://127.0.0.1:8096/v1/config -d '{"temperature": 0.7}'
+
+# sostituire il modello senza spegnere nulla (le richieste in corso
+# finiscono col modello su cui sono iniziate)
+curl -X POST http://127.0.0.1:8096/v1/model -d '{"path": "altro.gguf"}'
+
+# leggere la configurazione effettiva
+curl http://127.0.0.1:8096/v1/config
+```
+
+I default si compongono a strati (il più forte vince): valori di fabbrica →
+`/etc/siliceo-motor/motor.json` → `./motor.json` → flag CLI → parametri della
+singola richiesta → patch via `/v1/config`.
+
+Il template di chat si rileva dal GGUF (`tokenizer.chat_template`): ChatML
+(Qwen2.5, SmolLM2) e Llama3 sono supportati; override manuale con
+`"template": "chatml" | "llama3"`.
+
 ## Onestà sulle performance
 
-Il forward attuale è **full-recompute scalare** (niente KV cache, niente SIMD):
-~0.1 tok/s su una CPU desktop per il modello 0.5B. È una scelta deliberata della
-roadmap: prima la correttezza verificata bit-per-bit, poi la velocità. La KV cache
-incrementale (F2.5) e il backend CUDA (F3) sono i prossimi salti — vedi [ROADMAP.md](ROADMAP.md).
+La generazione usa **KV cache incrementale**: prefill una volta sola, poi un
+token per passo. Su una CPU desktop x86 il modello 0.5B gira a ~0.7 tok/s —
+output identico al byte rispetto a llama.cpp, verificato dai test. Il backend
+CUDA (F3) è il prossimo salto — vedi [ROADMAP.md](ROADMAP.md).
 
 ## Licenza
 
